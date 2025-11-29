@@ -34,6 +34,12 @@ type ApiBox = {
   yc?: number;
 };
 
+type UpdateStatus = {
+  num_images: number;
+  threshold: number;
+  ready: boolean;
+};
+
 export const UpdateTab: React.FC = () => {
   const [candidates, setCandidates] = useState<HistoryEvent[]>([]);
   const [page, setPage] = useState(1);
@@ -41,13 +47,16 @@ export const UpdateTab: React.FC = () => {
   const [pageSize] = useState(1); // xem từng event một
 
   const [loading, setLoading] = useState(false);
-  const [status, setStatus] = useState<{ num_images: number; threshold: number; ready: boolean } | null>(null);
+  const [status, setStatus] = useState<UpdateStatus | null>(null);
 
   // auto-label cho event hiện tại
   const [autoImageUrl, setAutoImageUrl] = useState<string | null>(null);
   const [autoBoxes, setAutoBoxes] = useState<ApiBox[]>([]);
   const [classCounts, setClassCounts] = useState<Record<string, number>>({});
   const [autoLoading, setAutoLoading] = useState(false);
+
+  // trạng thái gọi nút Update model (demo)
+  const [isStartingUpdate, setIsStartingUpdate] = useState(false);
 
   const toAbs = (p?: string) => {
     if (!p) return '';
@@ -150,6 +159,49 @@ export const UpdateTab: React.FC = () => {
     }
   };
 
+  // ====== NÚT UPDATE MODEL (LOCK) ======
+  const handleStartUpdate = async () => {
+    if (!status?.ready) {
+      alert(
+        `Chưa đủ số lượng ảnh để update. Hiện có ${status?.num_images ?? 0}/${
+          status?.threshold ?? 100
+        }.`,
+      );
+      return;
+    }
+
+    try {
+      setIsStartingUpdate(true);
+      const res = await fetch(`${API_BASE}/api/update/start`, {
+        method: 'POST',
+      });
+
+      let data: any = {};
+      try {
+        data = await res.json();
+      } catch {
+        // ignore parse error
+      }
+
+      if (!res.ok) {
+        console.error('Lỗi /api/update/start:', data);
+        alert(data.message || 'Backend báo lỗi khi gọi /api/update/start.');
+        return;
+      }
+
+      // Phiên bản hiện tại: chỉ thông báo "chưa hỗ trợ fine-tune tự động"
+      alert(
+        data.message ||
+          'ĐÃ ĐỦ 100 ẢNH trong update_pool. Phiên bản hiện tại chỉ dừng ở mức tạo dataset, fine-tune sẽ thực hiện thủ công bên ngoài.',
+      );
+    } catch (err) {
+      console.error(err);
+      alert('Có lỗi khi gọi /api/update/start.');
+    } finally {
+      setIsStartingUpdate(false);
+    }
+  };
+
   // ====== RENDER BBOX OVERLAY ======
   const renderBoxesOverlay = (boxes: ApiBox[]) => {
     const colorMap: Record<string, string> = {
@@ -241,9 +293,8 @@ export const UpdateTab: React.FC = () => {
           <p className="text-[11px] text-slate-400">
             Hệ thống tự dùng mô hình YOLOv8s hiện tại để gán nhãn 3 lớp (helmet / head /
             non-helmet) trên các khung hình VI_PHẠM / NGHI_NGỜ. Người dùng chỉ cần kiểm
-            tra lại và xác nhận ĐÚNG/S
-            AI, các ảnh + nhãn sẽ được lưu vào <code>update_pool/</code> để fine-tune
-            sau này.
+            tra lại và xác nhận ĐÚNG/SAI, các ảnh + nhãn sẽ được lưu vào{' '}
+            <code>update_pool/</code> để fine-tune sau này.
           </p>
         </div>
         {status && (
@@ -255,7 +306,7 @@ export const UpdateTab: React.FC = () => {
             ảnh
             {status.ready && (
               <span className="ml-1 text-emerald-400 font-semibold">
-                (ĐÃ ĐỦ để fine-tune)
+                (ĐÃ ĐỦ để tạo dataset fine-tune)
               </span>
             )}
           </div>
@@ -347,7 +398,7 @@ export const UpdateTab: React.FC = () => {
           )}
         </div>
 
-        {/* Câu hỏi ĐÚNG/SAI + đếm class */}
+        {/* Câu hỏi ĐÚNG/SAI + đếm class + trạng thái Update Pool */}
         <div className="bg-slate-950/80 border border-slate-800 rounded-2xl p-4 md:p-5 shadow-xl shadow-black/40 space-y-4 text-xs text-slate-300">
           <p className="font-semibold">
             Hành vi/nhãn được mô hình gán cho khung hình này có{' '}
@@ -426,24 +477,37 @@ export const UpdateTab: React.FC = () => {
             </button>
           </div>
 
+          {/* Trạng thái Update Pool + nút Update model (lock) */}
           {status && status.ready ? (
-            <div className="mt-3 text-[11px] text-emerald-300 bg-emerald-500/10 border border-emerald-500/40 rounded-lg px-3 py-2">
-              ✅ Đã đủ{' '}
-              <span className="font-mono">{status.num_images}</span> ảnh trong Update
-              Data Pool. Bạn có thể:
-              <br />
-              1) Đem thư mục <code>update_pool/images, update_pool/labels</code> lên
-              Kaggle/Colab để fine-tune YOLOv8s_ap.pt.
-              <br />
-              2) Mô tả quy trình này trong khóa luận như một vòng lặp cải thiện mô hình
-              dựa trên dữ liệu thực tế.
+            <div className="mt-3 text-[11px] text-emerald-300 bg-emerald-500/10 border border-emerald-500/40 rounded-lg px-3 py-2 space-y-2">
+              <p>
+                ✅ Đã đủ{' '}
+                <span className="font-mono">{status.num_images}</span> ảnh trong Update
+                Data Pool (ngưỡng: {status.threshold}). Bộ dữ liệu này có thể dùng để
+                fine-tune YOLOv8s_ap.pt.
+              </p>
+              <button
+                onClick={handleStartUpdate}
+                disabled={isStartingUpdate}
+                className="px-3 py-1.5 rounded-lg bg-emerald-500 text-white text-xs font-semibold hover:bg-emerald-400 disabled:bg-slate-700 disabled:text-slate-400"
+              >
+                {isStartingUpdate ? 'Đang kiểm tra...' : 'Update model (demo – khoá fine-tune)'}
+              </button>
+              <p className="text-emerald-200/80">
+                Phiên bản hiện tại{' '}
+                <span className="font-semibold">chỉ dừng ở mức tạo dataset</span> trong{' '}
+                <code>data/update_pool/images</code> &amp; <code>data/update_pool/labels</code>.
+                Quá trình fine-tune mô hình sẽ được thực hiện thủ công bằng script
+                Python ngoài ứng dụng (phục vụ báo cáo khóa luận).
+              </p>
             </div>
           ) : (
             <p className="text-[11px] text-slate-500">
               Hệ thống sẽ tiếp tục thu thập sự kiện mới từ tab{' '}
               <span className="font-semibold">Nhận diện</span>. Bạn có thể quay lại tab
               này bất kỳ lúc nào để duyệt thêm dữ liệu và xây dựng tập Update Pool lớn
-              hơn.
+              hơn. Khi đủ ngưỡng, nút <span className="font-mono">Update model</span> sẽ
+              được kích hoạt (ở chế độ demo, chỉ thông báo – không fine-tune tự động).
             </p>
           )}
         </div>

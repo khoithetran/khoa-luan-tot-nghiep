@@ -63,6 +63,21 @@ except Exception as e:
     model = None
 
 
+UPDATE_REQUIRED_COUNT = 100 
+
+def get_update_pool_images():
+    """
+    Trả về danh sách path các ảnh (.jpg/.jpeg/.png) đang nằm trong update_pool/images.
+    Dùng để đếm số lượng ảnh đã được chấp nhận vào Update Data Pool.
+    """
+    exts = {".jpg", ".jpeg", ".png"}
+    if not UPDATE_POOL_IMAGES_DIR.exists():
+        return []
+    return [
+        p
+        for p in UPDATE_POOL_IMAGES_DIR.iterdir()
+        if p.is_file() and p.suffix.lower() in exts
+    ]
 
 # ================== FASTAPI SETUP ==================
 
@@ -1791,6 +1806,52 @@ def post_update_mark(req: UpdateMarkRequest):
         "label_path": str(label_path),
         "num_boxes": len(boxes),
     }
+
+class UpdateStartResponse(BaseModel):
+    ok: bool
+    started: bool
+    message: str
+    count: int
+    required: int
+
+@app.post("/api/update/start", response_model=UpdateStartResponse)
+def start_update_finetune():
+    """
+    TẠM THỜI KHÓA CHỨC NĂNG FINE-TUNE TỰ ĐỘNG.
+
+    Hệ thống chỉ dừng ở mức:
+      - Gom ảnh + nhãn vào update_pool/images, update_pool/labels
+      - Đếm số lượng ảnh để báo cho người dùng
+
+    Khi frontend bấm nút UPDATE:
+      - Nếu chưa đủ 100 ảnh → báo chưa đủ
+      - Nếu đủ ≥100 ảnh     → báo tính năng fine-tune tự động chưa hỗ trợ
+    """
+    imgs = get_update_pool_images()
+    count = len(imgs)
+    required = UPDATE_REQUIRED_COUNT
+
+    if count < required:
+        return UpdateStartResponse(
+            ok=False,
+            started=False,
+            message=f"Chưa đủ số lượng ảnh để update (hiện có {count}/{required}).",
+            count=count,
+            required=required,
+        )
+
+    # ĐÃ ĐỦ 100 ẢNH nhưng KHÓA CHỨC NĂNG FINE-TUNE, chỉ dùng như dataset
+    return UpdateStartResponse(
+        ok=False,
+        started=False,
+        message=(
+            "ĐÃ ĐỦ 100 ẢNH trong update_pool, có thể dùng làm dataset để fine-tune "
+            "ở ngoài (chạy script train riêng). Tính năng fine-tune tự động trong "
+            "ứng dụng hiện CHƯA được hỗ trợ."
+        ),
+        count=count,
+        required=required,
+    )
 
 
 
