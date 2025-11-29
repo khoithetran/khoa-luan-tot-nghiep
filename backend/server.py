@@ -5,12 +5,9 @@ import time
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import List, Optional
 
-from typing import Optional, List
+from typing import Optional, List, Dict
 import json
-from pydantic import BaseModel
-from fastapi import Query
 
 import numpy as np
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Query
@@ -24,8 +21,9 @@ import cv2
 from collections import deque
 
 from ultralytics import YOLO
+import uvicorn
+import shutil
 
-from typing import Dict
 
 LIVE_STREAMS: Dict[str, dict] = {}
 
@@ -43,6 +41,16 @@ HISTORY_JSONL = HISTORY_DIR / "history.jsonl"
 VIDEOS_DIR = DATA_DIR / "videos"
 VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 
+UPDATE_POOL_DIR = DATA_DIR / "update_pool"
+UPDATE_POOL_IMAGES_DIR = UPDATE_POOL_DIR / "images"
+UPDATE_POOL_LABELS_DIR = UPDATE_POOL_DIR / "labels"
+UPDATE_POOL_META = UPDATE_POOL_DIR / "accepted.jsonl"
+
+UPDATE_POOL_DIR.mkdir(parents=True, exist_ok=True)
+UPDATE_POOL_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+UPDATE_POOL_LABELS_DIR.mkdir(parents=True, exist_ok=True)
+HISTORY_GLOBAL_DIR = DATA_DIR / "history" / "global"
+HISTORY_GLOBAL_DIR.mkdir(parents=True, exist_ok=True)
 
 for d in [DATA_DIR, HISTORY_DIR, GLOBAL_DIR, CROPS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
@@ -381,6 +389,121 @@ def load_all_history() -> List[HistoryEvent]:
     return events
 
 tracker = SimpleIOUTracker(iou_thresh=0.4, max_age=10)
+
+# ================== UPDATE ==================
+
+
+def read_all_history() -> List[HistoryEvent]:
+    events: List[HistoryEvent] = []
+    if not HISTORY_JSONL.exists():
+        return events
+    with open(HISTORY_JSONL, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                events.append(HistoryEvent(**obj))
+            except Exception as e:
+                print("[WARN] Lỗi parse history:", e)
+    return events
+
+# mapping class name → id theo thứ tự training
+CLASS_NAME_TO_ID = {
+    "helmet": 0,
+    "head": 1,
+    "non-helmet": 2,
+}
+
+def run_yolo_update_inference(img_path: Path):
+    """
+    Chạy YOLO trên ảnh global để:
+      - Trả về danh sách boxes chuẩn hoá:
+          class_name: 'helmet' | 'head' | 'non-helmet'
+          class_id:   0 | 1 | 2
+          confidence
+          xc, yc, width, height (normalized, center)
+          x, y, x1, y1, x2, y2 (normalized, topleft / bottomright)
+      - Trả về class_counts: {'helmet': n1, 'head': n2, 'non-helmet': n3}
+    """
+    # TODO: đổi YOLO_MODEL thành model bạn đang dùng
+    results = model(img_path)
+    r = results[0]
+
+    xywhn = r.boxes.xywhn.cpu().numpy()   # (N,4) [xc, yc, w, h]
+    cls_ids = r.boxes.cls.cpu().numpy()   # (N,)
+    confs   = r.boxes.conf.cpu().numpy()  # (N,)
+
+    boxes = []
+    class_counts = {
+        "helmet": 0,
+        "head": 0,
+        "non-helmet": 0,
+    }
+
+    for i in range(len(xywhn)):
+        xc, yc, w, h = map(float, xywhn[i])
+        raw_cls_id = int(cls_ids[i])
+        conf = float(confs[i])
+
+        raw_name = str(r.names.get(raw_cls_id, str(raw_cls_id)))
+
+        # Dùng bộ normalize đã có sẵn trong server
+        if is_head_class(raw_name):
+            name = "head"
+        elif is_nonhelmet_class(raw_name):
+            name = "non-helmet"
+        else:
+            name = "helmet"
+
+        # Đếm thống kê
+        if name in class_counts:
+            class_counts[name] += 1
+
+        # map sang id 0/1/2 cho YOLO txt
+        if name == "helmet":
+            cls_id = 0
+        elif name == "head":
+            cls_id = 1
+        else:
+            cls_id = 2
+
+        # chuyển center (xc, yc, w, h) → topleft/bottomright
+        x1 = xc - w / 2
+        y1 = yc - h / 2
+        x2 = xc + w / 2
+        y2 = yc + h / 2
+
+        # clamp cho an toàn
+        x1 = max(0.0, min(1.0, x1))
+        y1 = max(0.0, min(1.0, y1))
+        x2 = max(0.0, min(1.0, x2))
+        y2 = max(0.0, min(1.0, y2))
+
+        boxes.append({
+            "id": f"update_box_{i}",
+            "class_name": name,
+            "class_id": cls_id,
+            "confidence": conf,
+            # center format
+            "xc": xc,
+            "yc": yc,
+            "width": w,
+            "height": h,
+            # topleft / bottomright (normalized) – giống format detect/image
+            "x": x1,
+            "y": y1,
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+        })
+
+    return boxes, class_counts
+
+
+
 
 # ================== API ENDPOINTS ==================
 
@@ -1405,11 +1528,290 @@ def get_latest_history_event(
 
     return HistoryLatestResponse(event=latest)
 
+def _get_event_type(e) -> str | None:
+    # Ưu tiên event_type, nếu không có thì fallback sang type
+    et = getattr(e, "event_type", None)
+    if et is None:
+        et = getattr(e, "type", None)
+    return et
+
+def _get_global_image_rel(e) -> str | None:
+    giu = getattr(e, "global_image_url", None)
+    if not giu:
+        giu = getattr(e, "globalImageUrl", None)
+    return giu
+
+def read_marked_event_ids() -> set[str]:
+    """
+    Đọc file meta (UPDATE_POOL_META) để lấy danh sách event_id
+    đã được người dùng đánh dấu Đúng/Sai.
+    """
+    ids: set[str] = set()
+    if not UPDATE_POOL_META.exists():
+        return ids
+
+    with open(UPDATE_POOL_META, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                eid = obj.get("event_id")
+                if eid:
+                    ids.add(eid)
+            except Exception:
+                # bỏ qua dòng lỗi, tránh crash
+                continue
+    return ids
+
+@app.get("/api/update/candidates")
+def get_update_candidates(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=50),
+):
+    events: List[HistoryEvent] = read_all_history()
+
+    # event nào đã xuất hiện trong update_pool (accepted.jsonl)
+    # sẽ không hiển thị nữa
+    marked_ids = read_marked_event_ids()
+
+    filtered: List[HistoryEvent] = []
+    for e in events:
+        # bỏ qua event đã xử lý rồi (Đúng hoặc Sai)
+        if e.id in marked_ids:
+            continue
+
+        et = _get_event_type(e)
+        if et not in ("VI_PHAM", "NGHI_NGO"):
+            continue
+
+        giu = _get_global_image_rel(e)
+        if not giu:
+            continue
+
+        filtered.append(e)
+
+    # sắp xếp mới nhất ở trên
+    filtered.sort(key=lambda e: e.timestamp, reverse=True)
+
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_items = filtered[start:end]
+
+    return {
+        "total": len(filtered),
+        "page": page,
+        "page_size": page_size,
+        "items": [e.model_dump() for e in page_items],
+    }
+
+
+def _resolve_image_file(img_rel: str) -> Path:
+    """
+    Cố gắng tìm file ảnh thật từ chuỗi lưu trong global_image_url.
+
+    Ưu tiên:
+      1) Nếu img_rel là path tuyệt đối và tồn tại → dùng luôn.
+      2) Map theo tên file vào thư mục D:\KLTN_Code\backend\data\history\global.
+      3) Thử các biến thể tương đối: DATA_DIR / raw, DATA_DIR.parent / raw.
+    """
+    img_rel_norm = img_rel.replace("\\", "/").strip()
+
+    # 1) Nếu là đường dẫn tuyệt đối
+    p_abs = Path(img_rel_norm)
+    if p_abs.is_absolute() and p_abs.exists():
+        return p_abs
+
+    # 2) Luôn ưu tiên tìm theo basename trong thư mục history/global
+    basename = Path(img_rel_norm).name
+    cand0 = HISTORY_GLOBAL_DIR / basename
+    if cand0.exists():
+        return cand0
+
+    # 3) Thử các dạng tương đối
+    raw = img_rel_norm.lstrip("/")
+
+    cand1 = DATA_DIR / raw           # vd: data/history/global/xxx.jpg
+    cand2 = DATA_DIR.parent / raw    # vd: backend/data/history/global/xxx.jpg
+
+    if cand1.exists():
+        return cand1
+    if cand2.exists():
+        return cand2
+
+    # 4) fallback: trả về cand0 (để khi raise 404 còn in ra được)
+    return cand0
+
+
+@app.get("/api/update/auto-label/{event_id}")
+def get_update_auto_label(event_id: str):
+    events = read_all_history()
+    target = None
+    for e in events:
+        if e.id == event_id:
+            target = e
+            break
+
+    if not target:
+        raise HTTPException(status_code=404, detail="Không tìm thấy event.")
+
+    img_rel = _get_global_image_rel(target)
+    if not img_rel:
+        raise HTTPException(status_code=400, detail="Event không có global_image_url.")
+
+    img_path = _resolve_image_file(img_rel)
+    if not img_path.exists():
+        raise HTTPException(status_code=404, detail=f"Không tìm thấy file ảnh global: {img_path}")
+
+    boxes, class_counts = run_yolo_update_inference(img_path)
+
+    # URL public cho frontend: nếu history đã lưu dạng /data/.... thì cứ dùng lại
+    img_url = img_rel.replace("\\", "/")
+    if not img_url.startswith("/"):
+        # fallback: dựng URL theo kiểu /data/history/global/<basename>
+        img_url = f"/data/history/global/{Path(img_url).name}"
+
+    return {
+        "event_id": target.id,
+        "image_url": img_url,
+        "boxes": boxes,
+        "class_counts": class_counts,
+    }
+
+
+class UpdateMarkRequest(BaseModel):
+    event_id: str
+    accepted: bool
+
+from fastapi import HTTPException
+
+@app.post("/api/update/mark")
+def post_update_mark(req: UpdateMarkRequest):
+    """
+    Người dùng xác nhận ĐÚNG / SAI cho một event trong lịch sử:
+
+    - Nếu accepted = False:
+        + Chỉ ghi log vào update_pool/accepted.jsonl
+        + Không copy ảnh, không tạo nhãn.
+
+    - Nếu accepted = True:
+        + Tìm ảnh global tương ứng event (data/history/global)
+        + Chạy lại YOLO để auto-label 3 class
+        + Copy ảnh sang update_pool/images/
+        + Ghi file YOLO .txt sang update_pool/labels/
+        + Ghi log accepted vào update_pool/accepted.jsonl
+    """
+    events = read_all_history()
+    target: HistoryEvent | None = None
+    for e in events:
+        if e.id == req.event_id:
+            target = e
+            break
+
+    if not target:
+        raise HTTPException(status_code=404, detail="Không tìm thấy event trong lịch sử.")
+
+    # lấy đường dẫn ảnh global từ event (hỗ trợ cả global_image_url / globalImageUrl)
+    img_rel = _get_global_image_rel(target)
+    if not img_rel:
+        raise HTTPException(status_code=400, detail="Event không có global_image_url.")
+
+    # resolve sang file thật trong ổ D:\KLTN_Code\backend\data\history\global
+    src_path = _resolve_image_file(img_rel)
+    if not src_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Không tìm thấy file ảnh global: {src_path}"
+        )
+
+    # đảm bảo thư mục update_pool tồn tại
+    UPDATE_POOL_DIR.mkdir(parents=True, exist_ok=True)
+    UPDATE_POOL_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    UPDATE_POOL_LABELS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ghi log accepted / rejected vào accepted.jsonl
+    with open(UPDATE_POOL_META, "a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "event_id": target.id,
+            "timestamp": target.timestamp,
+            "source": target.source,
+            "type": _get_event_type(target),
+            "accepted": req.accepted,
+        }, ensure_ascii=False) + "\n")
+
+    # Nếu người dùng chọn SAI → không đưa vào update_pool
+    if not req.accepted:
+        return {"ok": True, "accepted": False}
+
+    # Nếu accepted = True → chạy YOLO để tạo nhãn + copy ảnh
+    try:
+        boxes, class_counts = run_yolo_update_inference(src_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi YOLO khi tạo nhãn: {e}")
+
+    # đặt tên file đích theo id event + tên gốc
+    dst_stem = f"{target.id}_{src_path.stem}"
+    dst_img_name = dst_stem + src_path.suffix
+    dst_label_name = dst_stem + ".txt"
+
+    dst_img_path = UPDATE_POOL_IMAGES_DIR / dst_img_name
+    label_path = UPDATE_POOL_LABELS_DIR / dst_label_name
+
+    # copy ảnh sang update_pool/images
+    shutil.copy2(src_path, dst_img_path)
+
+    # ghi file .txt theo format YOLO: class_id xc yc w h (normalized)
+    with open(label_path, "w", encoding="utf-8") as f:
+        for b in boxes:
+            class_name = str(b.get("class_name", ""))
+            cls_id = b.get("class_id")
+
+            # fallback nếu run_yolo_update_inference không set class_id
+            if cls_id is None:
+                cls_id = CLASS_NAME_TO_ID.get(class_name, 0)
+
+            xc = float(b.get("xc", 0.0))
+            yc = float(b.get("yc", 0.0))
+            w = float(b.get("width", 0.0))
+            h = float(b.get("height", 0.0))
+
+            # đảm bảo trong [0,1]
+            xc = max(0.0, min(1.0, xc))
+            yc = max(0.0, min(1.0, yc))
+            w = max(0.0, min(1.0, w))
+            h = max(0.0, min(1.0, h))
+
+            f.write(f"{int(cls_id)} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}\n")
+
+    return {
+        "ok": True,
+        "accepted": True,
+        "image_path": str(dst_img_path),
+        "label_path": str(label_path),
+        "num_boxes": len(boxes),
+    }
+
+
+
+@app.get("/api/update/status")
+def get_update_status():
+    if not UPDATE_POOL_IMAGES_DIR.exists():
+        count = 0
+    else:
+        count = sum(1 for _ in UPDATE_POOL_IMAGES_DIR.glob("*.*"))
+
+    threshold = 100
+    return {
+        "num_images": count,
+        "threshold": threshold,
+        "ready": count >= threshold,
+    }
+
+
 # ================== MAIN (chạy trực tiếp) ==================
 
 if __name__ == "__main__":
-    import uvicorn
-
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
